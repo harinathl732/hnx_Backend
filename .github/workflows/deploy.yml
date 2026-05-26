@@ -17,7 +17,7 @@ jobs:
           port: 22
           script: |
             # Navigate to backend directory
-            cd /var/www/smart3algo-backend || cd ~/smart3algo-backend || cd /home/ubuntu/smart3algo-backend
+            cd ~/hnx_Backend
             
             # Fetch latest code from GitHub
             git pull origin main
