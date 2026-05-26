@@ -126,10 +126,11 @@ async def get_zerodha_login_url(
         raise HTTPException(status_code=400, detail="Configure API key and secret first")
     
     import urllib.parse
-    encoded_email = urllib.parse.quote(current_user.email)
+    # Zerodha Kite Connect requires custom params inside redirect_params!
+    redirect_params_str = f"state={current_user.email}"
+    encoded_redirect_params = urllib.parse.quote(redirect_params_str)
     
-    # Store the URL-encoded email in the 'state' parameter to identify them securely
-    login_url = f"https://kite.zerodha.com/connect/login?api_key={db_broker.encrypted_api_key}&v=3&state={encoded_email}"
+    login_url = f"https://kite.zerodha.com/connect/login?api_key={db_broker.encrypted_api_key}&v=3&redirect_params={encoded_redirect_params}"
     return {"login_url": login_url}
 
 @router.get("/zerodha/callback", response_class=HTMLResponse)
