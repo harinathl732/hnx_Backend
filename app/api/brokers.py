@@ -279,3 +279,20 @@ async def zerodha_callback(
     </html>
     """
     return HTMLResponse(content=html_content)
+
+
+@router.post("/zerodha/disconnect")
+async def disconnect_zerodha(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    db_broker = db.query(Broker).filter(Broker.user_id == current_user.id).first()
+    if db_broker:
+        db.delete(db_broker)
+        db.commit()
+    
+    # Clean up running trading engine session
+    if current_user.email in trading_engine.active_sessions:
+        del trading_engine.active_sessions[current_user.email]
+        
+    return {"status": "success", "message": "Broker disconnected and credentials wiped successfully"}

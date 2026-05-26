@@ -30,8 +30,8 @@ jobs:
             # Install python requirements
             pip install -r requirements.txt
             
-            # Restart backend. Supports systemd, pm2, or direct background processes
-            sudo systemctl restart hnx-backend || pm2 restart hnx-backend || pm2 restart all || killall uvicorn || true
+            # Force-kill any old process holding port 8000 to prevent port conflict
+            sudo fuser -k 8000/tcp || kill -9 $(lsof -t -i:8000) || kill -9 $(netstat -nlp | grep :8000 | awk '{print $7}' | cut -d'/' -f1) || true
             
             # If backend is not running, start it in the background as a fallback
             if ! pgrep -f "uvicorn app.main:app" > /dev/null; then
