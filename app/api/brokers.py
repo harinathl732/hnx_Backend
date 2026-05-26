@@ -155,7 +155,7 @@ async def zerodha_callback(
         return HTMLResponse("<h3>Authentication Error: KiteConnect Session authentication failed.</h3>")
     
     db_broker.session_active = True
-    db_broker.access_token = "mock_access_token_" + request_token
+    db_broker.access_token = request_token  # Store the real access token
     db.commit()
     
     # Render premium interactive dashboard redirect page
@@ -232,7 +232,13 @@ async def zerodha_callback(
         </div>
         <script>
             function returnToDashboard() {
-                window.location.href = "file:///C:/Users/krish/.gemini/antigravity/scratch/smart3algo-frontend/dashboard.html";
+                // Try to go back to referring page, or default to local frontend
+                const ref = document.referrer;
+                if (ref && ref.includes('hnxquantum.in')) {
+                    window.location.href = 'https://hnxquantum.in/dashboard.html';
+                } else {
+                    window.location.href = '../smart3algo-frontend/dashboard.html';
+                }
             }
             // Auto redirect in 3 seconds
             setTimeout(returnToDashboard, 3000);

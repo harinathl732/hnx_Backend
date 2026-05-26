@@ -5,3 +5,4 @@ pydantic-settings==2.2.1
 PyJWT==2.8.0
 sqlalchemy==2.0.28
 pg8000>=1.30.0
+kiteconnect>=5.0.1

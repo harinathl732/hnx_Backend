@@ -1,56 +1,57 @@
 import asyncio
 import logging
-import random
 from datetime import datetime
 from typing import Dict, Optional
 
-# Mock KiteConnect SDK - To illustrate real production Kite SDK interactions
-# In real production: from kiteconnect import KiteConnect
-class MockKiteConnect:
-    def __init__(self, api_key: str, api_secret: str):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.access_token = None
-
-    def generate_session(self, request_token: str, api_secret: str):
-        # Authenticates session via broker callback redirect
-        self.access_token = "mock_access_token_" + request_token
-        return {"access_token": self.access_token, "user_id": "VB_TRADER_101"}
-
-    def ltp(self, instrument_token: str) -> Dict[str, Dict[str, float]]:
-        # Returns Last Traded Price for instruments
-        base_prices = {"NSE:NIFTY 50": 22400.0, "NSE:NIFTY BANK": 48000.0}
-        current_ltp = base_prices.get(instrument_token, 150.0)
-        # Add random tick fluctuation to simulate live market movements
-        fluctuation = random.uniform(-5.0, 5.2)
-        return {instrument_token: {"last_price": current_ltp + fluctuation}}
-
-    def place_order(self, variety, exchange, tradingsymbol, transaction_type, quantity, product, order_type, price=None, trigger_price=None):
-        # Simulated order placement
-        order_id = "ORD_" + str(random.randint(100000, 999999))
-        logging.info(f"[ORDER PLACED] ID: {order_id} | {transaction_type} {quantity} qty of {tradingsymbol} ({exchange}) via {product}")
-        return order_id
+# ============================================================
+# REAL KiteConnect SDK — Zerodha Official Python Library
+# ============================================================
+try:
+    from kiteconnect import KiteConnect
+    KITE_AVAILABLE = True
+except ImportError:
+    KITE_AVAILABLE = False
+    logging.warning("kiteconnect not installed. Run: pip install kiteconnect>=5.0.1")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+
 class TradingEngine:
     def __init__(self):
-        self.active_sessions: Dict[str, MockKiteConnect] = {}  # user_id -> Kite instance
-        self.running_strategies: Dict[str, Dict[str, dict]] = {}  # user_id -> {strategy_id -> settings}
-        self.live_pnls: Dict[str, dict] = {}  # user_id -> {live_pnl, status, positions}
-        self.execution_tasks: Dict[str, asyncio.Task] = {}  # user_id -> asyncio Task
+        # user_id -> KiteConnect instance (real Zerodha SDK)
+        self.active_sessions: Dict[str, "KiteConnect"] = {}
+        # user_id -> {strategy_id -> settings dict}
+        self.running_strategies: Dict[str, Dict[str, dict]] = {}
+        # user_id -> live pnl cache (updated every tick)
+        self.live_pnls: Dict[str, dict] = {}
+        # user_id -> asyncio background task
+        self.execution_tasks: Dict[str, asyncio.Task] = {}
 
-    async def initialize_session(self, user_id: str, api_key: str, api_secret: str, request_token: str) -> bool:
-        """Exchanges request token for active Kite API Session."""
+    # ----------------------------------------------------------
+    # SESSION INIT — Exchange request_token → access_token
+    # ----------------------------------------------------------
+    async def initialize_session(
+        self, user_id: str, api_key: str, api_secret: str, request_token: str
+    ) -> bool:
+        """
+        Exchange Zerodha request_token for a real access_token.
+        Called once per day after user logs in via Zerodha OAuth.
+        """
+        if not KITE_AVAILABLE:
+            logging.error("kiteconnect not installed. Cannot initialize real session.")
+            return False
         try:
-            # Wrap synchronous SDK block in asyncio-safe run_in_executor
             loop = asyncio.get_running_loop()
-            kite = MockKiteConnect(api_key, api_secret)
-            
-            # Simulated network latency of API exchange
-            session = await loop.run_in_executor(None, kite.generate_session, request_token, api_secret)
-            
+
+            def _generate():
+                kite = KiteConnect(api_key=api_key)
+                session = kite.generate_session(request_token, api_secret=api_secret)
+                kite.set_access_token(session["access_token"])
+                return kite
+
+            kite = await loop.run_in_executor(None, _generate)
+
             self.active_sessions[user_id] = kite
             self.live_pnls[user_id] = {
                 "live_pnl": 0.0,
@@ -58,180 +59,225 @@ class TradingEngine:
                 "active_positions_count": 0,
                 "positions": {}
             }
-            logging.info(f"Successfully initialized Kite Session for user {user_id}")
+            logging.info(f"[ZERODHA] Real KiteConnect session initialized for user: {user_id}")
             return True
+
         except Exception as e:
-            logging.error(f"Error during Kite Connect authorization handshake: {e}")
+            logging.error(f"[ZERODHA] Session init failed for {user_id}: {e}")
             return False
 
-    async def start_strategy(self, user_id: str, strategy_id: str, settings: dict):
-        """Starts a strategy loop for a user."""
-        if user_id not in self.running_strategies:
-            self.running_strategies[user_id] = {}
-        
-        self.running_strategies[user_id][strategy_id] = settings
-        logging.info(f"Strategy {strategy_id} deployed for user {user_id}. Running risk limits: {settings}")
-        
-        # Start the background task loop if it's not already running
-        if user_id not in self.execution_tasks or self.execution_tasks[user_id].done():
-            self.execution_tasks[user_id] = asyncio.create_task(self._live_trading_loop(user_id))
-
-    async def stop_strategy(self, user_id: str, strategy_id: str):
-        """Halts a strategy and triggers emergency exits for any open positions belonging to it."""
-        if user_id in self.running_strategies and strategy_id in self.running_strategies[user_id]:
-            del self.running_strategies[user_id][strategy_id]
-            logging.info(f"Strategy {strategy_id} stopped manually for user {user_id}")
-            
-            # Emergency position square-off
-            await self._emergency_square_off(user_id, strategy_id)
-            
-            if not self.running_strategies[user_id]:
-                # If no more active strategies, cancel the main trading task loop
-                if user_id in self.execution_tasks:
-                    self.execution_tasks[user_id].cancel()
-                    logging.info(f"Cancelled background execution loop for user {user_id}")
-
-    async def update_live_settings(self, user_id: str, strategy_id: str, settings: dict):
-        """Dynamically applies new MTM limits or lot sizing to active strategies."""
-        if user_id in self.running_strategies and strategy_id in self.running_strategies[user_id]:
-            self.running_strategies[user_id][strategy_id] = settings
-            logging.info(f"Dynamic setting override applied to active strategy {strategy_id} for user {user_id}")
-
+    # ----------------------------------------------------------
+    # GET REAL LIVE P&L — from Zerodha positions API
+    # ----------------------------------------------------------
     async def get_live_pnl(self, user_id: str) -> dict:
-        """Returns the cached PnL and active status for dashboard API consumption."""
-        user_pnl = self.live_pnls.get(user_id, {
+        """
+        Fetch REAL live P&L from Zerodha positions API.
+        Returns total unrealized + realized P&L for today.
+        """
+        kite = self.active_sessions.get(user_id)
+
+        if kite:
+            try:
+                loop = asyncio.get_running_loop()
+
+                def _fetch_positions():
+                    return kite.positions()
+
+                pos_data = await loop.run_in_executor(None, _fetch_positions)
+
+                # Sum up today's net P&L across all positions
+                net_positions = pos_data.get("net", [])
+                total_pnl = sum(
+                    p.get("unrealised", 0) + p.get("realised", 0)
+                    for p in net_positions
+                )
+                open_count = sum(1 for p in net_positions if p.get("quantity", 0) != 0)
+
+                # Update cache
+                self.live_pnls[user_id] = {
+                    "live_pnl": round(total_pnl, 2),
+                    "status": "active",
+                    "active_positions_count": open_count,
+                    "positions": {p["tradingsymbol"]: p for p in net_positions}
+                }
+
+                logging.info(f"[ZERODHA] Live PnL for {user_id}: ₹{total_pnl:.2f} | {open_count} positions")
+
+            except Exception as e:
+                logging.error(f"[ZERODHA] Failed to fetch positions for {user_id}: {e}")
+
+        cached = self.live_pnls.get(user_id, {
             "live_pnl": 0.0,
             "status": "inactive",
             "active_positions_count": 0
         })
+
         return {
             "user_id": user_id,
-            "live_pnl": round(user_pnl["live_pnl"], 2),
-            "status": user_pnl["status"],
+            "live_pnl": round(cached.get("live_pnl", 0.0), 2),
+            "status": cached.get("status", "inactive"),
             "timestamp": datetime.now().isoformat(),
-            "active_positions_count": user_pnl["active_positions_count"]
+            "active_positions_count": cached.get("active_positions_count", 0)
         }
 
-    async def _live_trading_loop(self, user_id: str):
+    # ----------------------------------------------------------
+    # GET REAL POSITIONS — full position details
+    # ----------------------------------------------------------
+    async def get_positions(self, user_id: str) -> list:
         """
-        The Core Production Tick Engine.
-        Runs continuously in the background to:
-        1. Fetch Live Option Ticks.
-        2. Evaluate signal triggers.
-        3. Place orders.
-        4. Track live positions & P&L.
-        5. Enforce Mark-to-Market (MTM) Guard emergency triggers.
+        Fetch real open positions from Zerodha.
         """
-        logging.info(f"Background trading loop successfully spawned for user: {user_id}")
         kite = self.active_sessions.get(user_id)
-        
         if not kite:
-            logging.error(f"Cannot run trading loop for {user_id}. Active broker session not found.")
-            return
+            return []
+        try:
+            loop = asyncio.get_running_loop()
+            pos_data = await loop.run_in_executor(None, kite.positions)
+            return pos_data.get("net", [])
+        except Exception as e:
+            logging.error(f"[ZERODHA] get_positions failed for {user_id}: {e}")
+            return []
 
+    # ----------------------------------------------------------
+    # GET REAL MARGIN — available funds from Zerodha
+    # ----------------------------------------------------------
+    async def get_margin(self, user_id: str) -> dict:
+        """
+        Fetch real available margin/funds from Zerodha.
+        """
+        kite = self.active_sessions.get(user_id)
+        if not kite:
+            return {"available": 0.0, "used": 0.0}
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _fetch_margin():
+                return kite.margins("equity")
+
+            margin_data = await loop.run_in_executor(None, _fetch_margin)
+            available = margin_data.get("available", {}).get("live_balance", 0.0)
+            used = margin_data.get("utilised", {}).get("debits", 0.0)
+            return {"available": round(available, 2), "used": round(used, 2)}
+        except Exception as e:
+            logging.error(f"[ZERODHA] get_margin failed for {user_id}: {e}")
+            return {"available": 0.0, "used": 0.0}
+
+    # ----------------------------------------------------------
+    # GET ORDER HISTORY — today's orders from Zerodha
+    # ----------------------------------------------------------
+    async def get_orders(self, user_id: str) -> list:
+        """
+        Fetch today's real order history from Zerodha.
+        """
+        kite = self.active_sessions.get(user_id)
+        if not kite:
+            return []
+        try:
+            loop = asyncio.get_running_loop()
+            orders = await loop.run_in_executor(None, kite.orders)
+            return orders or []
+        except Exception as e:
+            logging.error(f"[ZERODHA] get_orders failed for {user_id}: {e}")
+            return []
+
+    # ----------------------------------------------------------
+    # START STRATEGY — register and start background loop
+    # ----------------------------------------------------------
+    async def start_strategy(self, user_id: str, strategy_id: str, settings: dict):
+        """Activates a strategy for a user and starts execution loop."""
+        if user_id not in self.running_strategies:
+            self.running_strategies[user_id] = {}
+
+        self.running_strategies[user_id][strategy_id] = settings
+        logging.info(f"[ENGINE] Strategy {strategy_id} deployed for {user_id}")
+
+        # Start background P&L polling loop if not already running
+        if user_id not in self.execution_tasks or self.execution_tasks[user_id].done():
+            self.execution_tasks[user_id] = asyncio.create_task(
+                self._live_pnl_polling_loop(user_id)
+            )
+
+    # ----------------------------------------------------------
+    # STOP STRATEGY
+    # ----------------------------------------------------------
+    async def stop_strategy(self, user_id: str, strategy_id: str):
+        """Stops a running strategy."""
+        if user_id in self.running_strategies:
+            self.running_strategies[user_id].pop(strategy_id, None)
+            logging.info(f"[ENGINE] Strategy {strategy_id} stopped for {user_id}")
+
+            # Cancel loop if no more strategies running
+            if not self.running_strategies[user_id]:
+                task = self.execution_tasks.get(user_id)
+                if task and not task.done():
+                    task.cancel()
+                    logging.info(f"[ENGINE] Background loop cancelled for {user_id}")
+
+    # ----------------------------------------------------------
+    # UPDATE LIVE SETTINGS dynamically
+    # ----------------------------------------------------------
+    async def update_live_settings(self, user_id: str, strategy_id: str, settings: dict):
+        """Dynamically apply new MTM limits or lot sizes to a running strategy."""
+        if user_id in self.running_strategies and strategy_id in self.running_strategies[user_id]:
+            self.running_strategies[user_id][strategy_id] = settings
+            logging.info(f"[ENGINE] Settings updated live for {strategy_id} / {user_id}")
+
+    # ----------------------------------------------------------
+    # BACKGROUND P&L POLLING LOOP
+    # Polls Zerodha every 3 seconds for real P&L updates
+    # ----------------------------------------------------------
+    async def _live_pnl_polling_loop(self, user_id: str):
+        """
+        Background task that polls Zerodha positions every 3 seconds.
+        Updates self.live_pnls cache used by /user/live-pnl endpoint.
+        """
+        logging.info(f"[ENGINE] Live P&L polling started for user: {user_id}")
         try:
             while True:
-                # 1. Fetch Ticks (Example: Fetching Nifty & BankNifty spot prices)
-                # In real production: use KiteTicker WebSocket client, or parallel multi-threading
-                nifty_tick = kite.ltp("NSE:NIFTY 50")["NSE:NIFTY 50"]["last_price"]
-                
-                # 2. Update simulated positions & P&L based on active strategies
-                total_pnl = 0.0
-                active_pos = 0
-                user_state = self.live_pnls.get(user_id, {})
-                
-                for strat_id, settings in list(self.running_strategies.get(user_id, {}).items()):
-                    # Simulate having an open position in an option contract
-                    # In real production, query self.active_sessions[user_id].positions()
-                    if strat_id not in user_state.get("positions", {}):
-                        # Enter a mock trade for demonstration (Buy 1 Nifty Call option)
-                        mock_strike = int(round(nifty_tick / 50.0) * 50.0)
-                        tradingsymbol = f"NIFTY{datetime.now().strftime('%y%m%d')}{mock_strike}CE"
-                        
-                        # Place order on exchange
-                        qty = settings["lot_size"] * 50  # Nifty lot size is 50
-                        order_id = kite.place_order(
-                            variety="regular", exchange="NFO", tradingsymbol=tradingsymbol,
-                            transaction_type="BUY", quantity=qty, product="MIS", order_type="MARKET"
-                        )
-                        
-                        user_state["positions"][strat_id] = {
-                            "tradingsymbol": tradingsymbol,
-                            "entry_price": 120.0,
-                            "current_price": 120.0,
-                            "quantity": qty,
-                            "order_id": order_id
-                        }
-                    
-                    # Update option premium dynamically based on index ticks
-                    pos = user_state["positions"][strat_id]
-                    index_change = nifty_tick - 22400.0  # reference base index
-                    pos["current_price"] = max(2.0, 120.0 + (index_change * 0.4) + random.uniform(-1.0, 1.2))  # Delta ≈ 0.4
-                    
-                    # Calculate open trade P&L: (Current Price - Entry Price) * Quantity
-                    pos_pnl = (pos["current_price"] - pos["entry_price"]) * pos["quantity"]
-                    total_pnl += pos_pnl
-                    active_pos += 1
-                
-                # 3. Check MTM Daily Guards across active strategies
-                # Enforce emergency stops if MTM enabled
+                # Only poll if user has running strategies
+                if not self.running_strategies.get(user_id):
+                    break
+
+                await self.get_live_pnl(user_id)
+
+                # Check MTM limits for each active strategy
+                cached = self.live_pnls.get(user_id, {})
+                total_pnl = cached.get("live_pnl", 0.0)
+
                 for strat_id, settings in list(self.running_strategies.get(user_id, {}).items()):
                     if settings.get("mtm_enabled"):
-                        pos_info = user_state["positions"].get(strat_id)
-                        if pos_info:
-                            strat_pnl = (pos_info["current_price"] - pos_info["entry_price"]) * pos_info["quantity"]
-                            
-                            # 3a. Max Loss Check (Target hit)
-                            if strat_pnl <= -settings["mtm_max_loss"]:
-                                logging.warning(f"[MTM EMERGENCY TRIGGERED] Daily Max Loss Limit (-₹{settings['mtm_max_loss']}) hit for {strat_id}!")
-                                user_state["status"] = "loss_hit"
-                                await self.stop_strategy(user_id, strat_id)
-                                
-                            # 3b. Max Profit Check (Target hit)
-                            elif strat_pnl >= settings["mtm_max_profit"]:
-                                logging.info(f"[MTM TARGET ACHIEVED] Daily Max Profit Target (+₹{settings['mtm_max_profit']}) achieved for {strat_id}!")
-                                user_state["status"] = "profit_hit"
-                                await self.stop_strategy(user_id, strat_id)
+                        max_loss = settings.get("mtm_max_loss", 5000)
+                        max_profit = settings.get("mtm_max_profit", 12000)
 
-                # Update live states
-                user_state["live_pnl"] = total_pnl
-                user_state["active_positions_count"] = active_pos
-                self.live_pnls[user_id].update(user_state)
-                
-                # Dynamic polling tick speed (Simulates 1-second background thread ticking)
-                await asyncio.sleep(1.0)
-                
+                        if total_pnl <= -max_loss:
+                            logging.warning(
+                                f"[MTM] Max loss -₹{max_loss} hit for {user_id}/{strat_id}! "
+                                f"Stopping strategy."
+                            )
+                            cached["status"] = "loss_hit"
+                            await self.stop_strategy(user_id, strat_id)
+
+                        elif total_pnl >= max_profit:
+                            logging.info(
+                                f"[MTM] Profit target +₹{max_profit} hit for {user_id}/{strat_id}! "
+                                f"Stopping strategy."
+                            )
+                            cached["status"] = "profit_hit"
+                            await self.stop_strategy(user_id, strat_id)
+
+                await asyncio.sleep(3)  # Poll every 3 seconds
+
         except asyncio.CancelledError:
-            logging.info(f"Trading loop gracefully shutdown for user {user_id}")
+            logging.info(f"[ENGINE] P&L polling loop cancelled for {user_id}")
         except Exception as e:
-            logging.error(f"Error in backend live-trading execution task loop: {e}")
+            logging.error(f"[ENGINE] Polling loop error for {user_id}: {e}")
 
-    async def _emergency_square_off(self, user_id: str, strategy_id: str):
-        """Places emergency sell order to secure remaining premium and close active broker positions."""
-        kite = self.active_sessions.get(user_id)
-        user_state = self.live_pnls.get(user_id)
-        
-        if not kite or not user_state:
-            return
+    # ----------------------------------------------------------
+    # CHECK IF SESSION IS ACTIVE
+    # ----------------------------------------------------------
+    def is_session_active(self, user_id: str) -> bool:
+        return user_id in self.active_sessions
 
-        pos = user_state["positions"].get(strategy_id)
-        if pos:
-            logging.info(f"[EMERGENCY CLEARANCE] Placing square-off sell order for {pos['quantity']} qty of {pos['tradingsymbol']}")
-            
-            # Place reversing order to sell active options holdings
-            kite.place_order(
-                variety="regular", exchange="NFO", tradingsymbol=pos["tradingsymbol"],
-                transaction_type="SELL", quantity=pos["quantity"], product="MIS", order_type="MARKET"
-            )
-            
-            # Purge positions
-            del user_state["positions"][strategy_id]
-            user_state["active_positions_count"] = len(user_state["positions"])
-            
-            # If all cleared, reset status or keep hit flag
-            if user_state["active_positions_count"] == 0:
-                if user_state["status"] not in ["profit_hit", "loss_hit"]:
-                    user_state["status"] = "inactive"
 
 # Global trading engine instance
 trading_engine = TradingEngine()

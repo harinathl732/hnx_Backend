@@ -195,5 +195,28 @@ async def control_strategy(
 
 @router.get("/live-pnl", response_model=LivePnLResponse)
 async def get_live_pnl(current_user: User = Depends(get_current_user)):
+    """Returns REAL live P&L from Zerodha positions API."""
     pnl_data = await trading_engine.get_live_pnl(current_user.email)
     return pnl_data
+
+
+@router.get("/positions")
+async def get_positions(current_user: User = Depends(get_current_user)):
+    """Returns REAL open positions from Zerodha."""
+    positions = await trading_engine.get_positions(current_user.email)
+    return {"positions": positions, "count": len(positions)}
+
+
+@router.get("/margin")
+async def get_margin(current_user: User = Depends(get_current_user)):
+    """Returns REAL available margin/funds from Zerodha."""
+    margin = await trading_engine.get_margin(current_user.email)
+    return margin
+
+
+@router.get("/orders")
+async def get_orders(current_user: User = Depends(get_current_user)):
+    """Returns REAL today's order history from Zerodha."""
+    orders = await trading_engine.get_orders(current_user.email)
+    return {"orders": orders, "count": len(orders)}
+
