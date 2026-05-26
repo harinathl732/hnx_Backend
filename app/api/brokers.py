@@ -125,16 +125,47 @@ async def get_zerodha_login_url(
     if not db_broker:
         raise HTTPException(status_code=400, detail="Configure API key and secret first")
     
-    # Store the user's email in the 'state' parameter to identify them securely in the redirect callback!
-    login_url = f"https://kite.zerodha.com/connect/login?api_key={db_broker.encrypted_api_key}&v=3&state={current_user.email}"
+    import urllib.parse
+    encoded_email = urllib.parse.quote(current_user.email)
+    
+    # Store the URL-encoded email in the 'state' parameter to identify them securely
+    login_url = f"https://kite.zerodha.com/connect/login?api_key={db_broker.encrypted_api_key}&v=3&state={encoded_email}"
     return {"login_url": login_url}
 
 @router.get("/zerodha/callback", response_class=HTMLResponse)
 async def zerodha_callback(
     request_token: str,
-    state: str,
+    state: str = None,
     db: Session = Depends(get_db)
 ):
+    if not state:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>HNX Quantum - Session Error</title>
+            <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+            <style>
+                body { background-color: #05060f; color: #ffffff; font-family: 'Outfit', sans-serif; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+                .card { background-color: #0b0c16; border: 1px solid rgba(255, 74, 74, 0.25); padding: 3rem; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(255, 74, 74, 0.1); max-width: 450px; }
+                .icon { font-size: 4rem; color: #ff4a4a; margin-bottom: 1.5rem; }
+                h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+                p { color: #9ca3af; font-size: 0.95rem; line-height: 1.5; margin-bottom: 2rem; }
+                .btn { background: linear-gradient(135deg, #ff7b00, #ffb700); color: #080914; padding: 0.75rem 2rem; border-radius: 12px; font-weight: 700; text-decoration: none; display: inline-block; cursor: pointer; border: none; transition: transform 0.2s; }
+                .btn:hover { transform: scale(1.05); }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="icon">✗</div>
+                <h1>Secure State Missing</h1>
+                <p>We could not securely verify your user session from the Zerodha redirect. Please make sure cookies are enabled and try again from your Settings tab.</p>
+                <a href="https://hnxquantum.in/settings.html" class="btn">Return to Settings</a>
+            </div>
+        </body>
+        </html>
+        """)
+
     # Find user using the email passed inside the state parameter!
     db_user = db.query(User).filter(User.email == state).first()
     if not db_user:
