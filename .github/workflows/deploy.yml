@@ -1,0 +1,39 @@
+name: Deploy Backend to Server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy using SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            # Navigate to backend directory
+            cd /var/www/smart3algo-backend || cd ~/smart3algo-backend || cd /home/ubuntu/smart3algo-backend
+            
+            # Fetch latest code from GitHub
+            git pull origin main
+            
+            # Activate virtual environment if present
+            if [ -d "venv" ]; then
+              source venv/bin/activate
+            fi
+            
+            # Install python requirements
+            pip install -r requirements.txt
+            
+            # Restart backend. Supports systemd, pm2, or direct background processes
+            sudo systemctl restart hnx-backend || pm2 restart hnx-backend || pm2 restart all || killall uvicorn || true
+            
+            # If backend is not running, start it in the background as a fallback
+            if ! pgrep -f "uvicorn app.main:app" > /dev/null; then
+              nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > backend.log 2>&1 &
+            fi
