@@ -18,6 +18,14 @@ router = APIRouter(
     tags=["Broker Integration"]
 )
 
+# ============================================================
+# SERVER-SIDE PENDING TOKEN CACHE
+# When user clicks "Authenticate", we store their email here.
+# When Zerodha redirects back with request_token, we look it up.
+# This avoids relying on Zerodha passing back any 'state' param.
+# ============================================================
+pending_auth: dict = {}  # api_key -> user_email
+
 # Authentication Config from settings
 JWT_SECRET = settings.jwt_secret
 ALGORITHM = settings.jwt_algorithm
@@ -125,69 +133,72 @@ async def get_zerodha_login_url(
     if not db_broker:
         raise HTTPException(status_code=400, detail="Configure API key and secret first")
     
-    import urllib.parse
-    # Zerodha Kite Connect requires custom params inside redirect_params!
-    redirect_params_str = f"state={current_user.email}"
-    encoded_redirect_params = urllib.parse.quote(redirect_params_str)
+    # Store user email in server-side cache keyed by their API key.
+    # When Zerodha redirects back, we look up who owns this API key.
+    pending_auth[db_broker.encrypted_api_key] = current_user.email
     
-    login_url = f"https://kite.zerodha.com/connect/login?api_key={db_broker.encrypted_api_key}&v=3&redirect_params={encoded_redirect_params}"
+    login_url = f"https://kite.zerodha.com/connect/login?api_key={db_broker.encrypted_api_key}&v=3"
     return {"login_url": login_url}
 
 @router.get("/zerodha/callback", response_class=HTMLResponse)
 async def zerodha_callback(
     request_token: str,
-    state: str = None,
+    action: str = None,
+    type: str = None,
+    status: str = None,
     db: Session = Depends(get_db)
 ):
-    if not state:
+    # Find user by looking up which API key is registered in our server-side cache.
+    # We match by finding the Broker record whose api_key is in pending_auth.
+    user_email = None
+    matched_api_key = None
+
+    for api_key, email in list(pending_auth.items()):
+        broker = db.query(Broker).filter(Broker.encrypted_api_key == api_key).first()
+        if broker:
+            user_email = email
+            matched_api_key = api_key
+            break
+
+    if not user_email:
         return HTMLResponse("""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>HNX Quantum - Session Error</title>
-            <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
-            <style>
-                body { background-color: #05060f; color: #ffffff; font-family: 'Outfit', sans-serif; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-                .card { background-color: #0b0c16; border: 1px solid rgba(255, 74, 74, 0.25); padding: 3rem; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(255, 74, 74, 0.1); max-width: 450px; }
-                .icon { font-size: 4rem; color: #ff4a4a; margin-bottom: 1.5rem; }
-                h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
-                p { color: #9ca3af; font-size: 0.95rem; line-height: 1.5; margin-bottom: 2rem; }
-                .btn { background: linear-gradient(135deg, #ff7b00, #ffb700); color: #080914; padding: 0.75rem 2rem; border-radius: 12px; font-weight: 700; text-decoration: none; display: inline-block; cursor: pointer; border: none; transition: transform 0.2s; }
-                .btn:hover { transform: scale(1.05); }
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <div class="icon">✗</div>
-                <h1>Secure State Missing</h1>
-                <p>We could not securely verify your user session from the Zerodha redirect. Please make sure cookies are enabled and try again from your Settings tab.</p>
-                <a href="https://hnxquantum.in/settings.html" class="btn">Return to Settings</a>
-            </div>
-        </body>
-        </html>
+        <!DOCTYPE html><html><head><title>HNX Quantum - Session Error</title>
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>body{background:#05060f;color:#fff;font-family:'Outfit',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}
+        .card{background:#0b0c16;border:1px solid rgba(255,74,74,.25);padding:3rem;border-radius:20px;text-align:center;max-width:450px;}
+        .icon{font-size:4rem;color:#ff4a4a;margin-bottom:1.5rem;} h1{font-size:1.8rem;margin-bottom:.5rem;}
+        p{color:#9ca3af;font-size:.95rem;line-height:1.5;margin-bottom:2rem;}
+        .btn{background:linear-gradient(135deg,#ff7b00,#ffb700);color:#080914;padding:.75rem 2rem;border-radius:12px;font-weight:700;text-decoration:none;display:inline-block;}</style></head>
+        <body><div class="card"><div class="icon">✗</div><h1>Session Expired</h1>
+        <p>Please go back to Settings and click "Authenticate Active Session" again.</p>
+        <a href="https://hnxquantum.in/settings.html" class="btn">Back to Settings</a></div></body></html>
         """)
 
-    # Find user using the email passed inside the state parameter!
-    db_user = db.query(User).filter(User.email == state).first()
+    # Clean up the pending_auth cache entry
+    pending_auth.pop(matched_api_key, None)
+
+    # Look up the user and broker records in the database
+    db_user = db.query(User).filter(User.email == user_email).first()
     if not db_user:
-        return HTMLResponse("<h3>Authentication Error: User session invalid.</h3>")
+        return HTMLResponse("<h3>Authentication Error: User not found in database.</h3>")
 
     db_broker = db.query(Broker).filter(Broker.user_id == db_user.id).first()
     if not db_broker:
         return HTMLResponse("<h3>Authentication Error: Broker credentials not configured.</h3>")
-    
+
+    # Exchange request_token for a real Zerodha access_token via KiteConnect SDK
     success = await trading_engine.initialize_session(
         user_id=db_user.email,
         api_key=db_broker.encrypted_api_key,
         api_secret=db_broker.encrypted_api_secret,
         request_token=request_token
     )
-    
+
     if not success:
-        return HTMLResponse("<h3>Authentication Error: KiteConnect Session authentication failed.</h3>")
-    
+        return HTMLResponse("<h3>Authentication Error: KiteConnect session exchange failed. Please try again.</h3>")
+
     db_broker.session_active = True
-    db_broker.access_token = request_token  # Store the real access token
+    db_broker.access_token = request_token
     db.commit()
     
     # Render premium interactive dashboard redirect page
